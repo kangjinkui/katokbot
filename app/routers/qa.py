@@ -227,27 +227,74 @@ class QALoader:
 # =========================
 # Service
 # =========================
+
+
+
 class QAService:
+    # ?? ??? ?? (RAG ??? ?? ?? ??)
+    SYNONYMS = {
+        "정산": ["정산", "계산", "집계", "처리"],
+        "업무": ["업무", "작업", "일", "처리"],
+        "시간": ["시간", "소요", "기간"],
+        "절약": ["절약", "단축", "감소"],
+        "식권": ["식권", "쿠폰", "한방쿠폰"],
+        "qr": ["qr", "qr코드", "큐알", "큐알c크론"],
+        "발급": ["발급", "출력", "배포", "재발급"],
+        "보고": ["보고", "보고서", "리포트", "정산보고"],
+        "결재": ["결재", "결제"],
+        "분실": ["분실", "유실", "잃어버림"],
+        "말일": ["말일", "월말", "마감"],
+    }
+
+    def normalize(self, text: str) -> str:
+        """??? ?? + ??/??? ??."""
+        lowered = text.lower()
+        cleaned = re.sub(r"[^\w\s\uac00-\ud7a3]", " ", lowered)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
     def sanitize_fts_query(self, query: str) -> str:
         """
-        FTS5 특수문자 제거 및 쿼리 정제
-        FTS5는 특정 특수문자를 연산자로 해석하므로 제거 필요
+        FTS5 ???? ?? ? ?? ??
+        FTS5? ?? ????? ???? ????? ?? ??
         """
-        # FTS5 특수문자 제거: " ~ ! @ # $ % ^ & * ( ) - + = { } [ ] | \ : ; ' < > , . ? /
-        # 한글, 영문, 숫자, 공백만 유지
-        sanitized = re.sub(r'[^\w\s가-힣]', ' ', query)
-
-        # 연속된 공백을 하나로
-        sanitized = re.sub(r'\s+', ' ', sanitized).strip()
-
+        sanitized = re.sub(r"[^\w\s\uac00-\ud7a3]", " ", query)
+        sanitized = re.sub(r"\s+", " ", sanitized).strip()
         logger.debug(f"[QA Search] Sanitized query: '{query}' -> '{sanitized}'")
-
         return sanitized
+
+    def expand_with_synonyms(self, query: str) -> str:
+        """
+        FTS5 ??? ???? ?? (OR ??).
+        ?: '?? ??' -> '(?? OR ?? OR ?? OR ??) (?? OR ?? OR ? OR ??)'
+        """
+        tokens = self.normalize(query).split()
+        expanded_tokens = []
+        for token in tokens:
+            syns = None
+            for key, values in self.SYNONYMS.items():
+                if token == key or token in values:
+                    syns = values
+                    break
+            if syns:
+                expanded_tokens.append("(" + " OR ".join(syns) + ")")
+            else:
+                expanded_tokens.append(token)
+        return " ".join(expanded_tokens)
+
+    def similarity(self, query: str, candidate: str) -> float:
+        """?? ??? ?? ??? ?? ??? ??."""
+        q_tokens = set(self.normalize(query).split())
+        c_tokens = set(self.normalize(candidate).split())
+        if not q_tokens or not c_tokens:
+            return 0.0
+        overlap = len(q_tokens & c_tokens) / len(q_tokens | c_tokens)
+        coverage = len(q_tokens & c_tokens) / len(q_tokens)
+        return 0.6 * overlap + 0.4 * coverage
 
     def search(self, query: str, top_k: int) -> List[dict]:
         logger.info(f"[QA Search] Query: '{query}', Top K: {top_k}")
 
-        # 쿼리 정제
         sanitized_query = self.sanitize_fts_query(query)
 
         if not sanitized_query:
@@ -269,15 +316,24 @@ class QAService:
         LIMIT ?
         """
 
-        logger.debug(f"[QA Search] Executing SQL with params: query={sanitized_query}, top_k={top_k}")
-        rows = db.execute_query(sql, (sanitized_query, top_k))
+        expanded_query = self.expand_with_synonyms(sanitized_query)
+        limit = top_k * 3  # ??? ??? ??? ???
+
+        logger.debug(f"[QA Search] Executing SQL with params: query={expanded_query}, limit={limit}")
+        rows = db.execute_query(sql, (expanded_query, limit))
 
         logger.info(f"[QA Search] Found {len(rows)} results")
 
-        # FTS rank: lower is better; return absolute for readability
         for r in rows:
             if "score" in r and r["score"] is not None:
                 r["score"] = abs(r["score"])
+
+        # ???: ?? ???? ?? ?? ??
+        for r in rows:
+            r["similarity"] = self.similarity(query, r["question"])
+
+        rows.sort(key=lambda x: x.get("similarity", 0), reverse=True)
+        rows = rows[:top_k]
 
         if rows:
             logger.debug(f"[QA Search] Top result: {rows[0]['question'][:50]}...")
@@ -285,7 +341,6 @@ class QAService:
             logger.warning(f"[QA Search] No results found for query: '{query}'")
 
         return rows
-
 
 # =========================
 # Router

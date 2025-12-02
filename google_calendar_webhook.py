@@ -23,12 +23,17 @@ from pydantic import BaseModel
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
+from search_utils import load_synonyms, expand_query, search_in_text, calculate_relevance_score
+
 load_dotenv()
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service-account.json")
 CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 TIMEZONE = os.getenv("CALENDAR_TIMEZONE", "Asia/Seoul")
+
+# 동의어 사전 로드
+SYNONYMS = load_synonyms("data/synonyms.json")
 
 
 def get_calendar_service():
@@ -190,6 +195,57 @@ def delete_event(event_id: str) -> str:
     return "🗑 일정이 삭제되었습니다. (ID: {})".format(event_id)
 
 
+def search_hanbang_qa(query: str) -> str:
+    """
+    한방식권 Q&A 문서에서 쿼리를 검색합니다.
+    동의어 사전을 활용한 확장 검색을 수행합니다.
+
+    Args:
+        query: 검색 쿼리
+
+    Returns:
+        검색 결과 텍스트
+    """
+    # 쿼리 확장
+    expanded_queries = expand_query(query, SYNONYMS)
+
+    # QA 파일 읽기
+    qa_file = "data/hanbang_qa.md"
+    if not os.path.exists(qa_file):
+        return "❌ Q&A 문서를 찾을 수 없습니다."
+
+    with open(qa_file, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # 섹션별로 분리 (## 기준)
+    sections = content.split("\n##")
+    results = []
+
+    for section in sections:
+        # 테이블 행별로 분리
+        lines = section.split("\n")
+        for line in lines:
+            # 확장된 쿼리로 검색
+            if search_in_text(line, expanded_queries):
+                # 관련도 점수 계산
+                score = calculate_relevance_score(line, expanded_queries, query)
+                results.append((score, line.strip()))
+
+    if not results:
+        return f"❌ '{query}'에 대한 검색 결과가 없습니다.\n💡 다른 키워드로 검색해보세요."
+
+    # 점수 기준 정렬 (높은 순)
+    results.sort(reverse=True, key=lambda x: x[0])
+
+    # 상위 5개 결과 반환
+    output = [f"🔍 '{query}' 검색 결과 (확장: {', '.join(expanded_queries[:3])}...):\n"]
+    for score, line in results[:5]:
+        if line and not line.startswith("|:--"):
+            output.append(f"• {line}")
+
+    return "\n".join(output)
+
+
 @app.post("/calendar/webhook")
 async def calendar_webhook(req: CalendarRequest):
     message = req.message.strip()
@@ -209,5 +265,17 @@ async def calendar_webhook(req: CalendarRequest):
         return "지원하지 않는 명령입니다. 예) 캘린더 조회, 캘린더 추가, 캘린더 삭제"
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/search")
+async def search_endpoint(req: CalendarRequest):
+    """
+    한방식권 Q&A 검색 엔드포인트
+    """
+    query = req.message.strip()
+    try:
+        return search_hanbang_qa(query)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
