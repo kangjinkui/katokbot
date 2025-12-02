@@ -114,22 +114,26 @@ class QALoader:
     }
 
     ENCODING_FIXES = {
-        "?�권": "쿠폰",
-        "?�산": "정산",
-        "?�당": "식당",
-        "?�스": "서비스",
-        "?�용": "사용",
-        "?�입": "도입",
+        # UTF-8 깨짐 패턴들
+        "?�": "",  # 깨진 문자 제거
+        "��": "",  # 깨진 문자 제거
     }
 
     def __init__(self):
         pass
 
     def clean_text(self, text: str) -> str:
+        # 볼드 마크다운 제거
         cleaned = text.replace("**", "").strip()
+
+        # 인코딩 깨짐 수정
         for bad, good in self.ENCODING_FIXES.items():
             cleaned = cleaned.replace(bad, good)
-        return cleaned
+
+        # 추가 정제: 유효하지 않은 유니코드 제거
+        cleaned = cleaned.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
+
+        return cleaned.strip()
 
     def normalize_section(self, section_line: str) -> str:
         for key, val in self.SECTION_MAP.items():
@@ -138,9 +142,21 @@ class QALoader:
         return section_line.strip()
 
     def parse_markdown(self, path: str) -> List[dict]:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.read().splitlines()
+        # UTF-8로 파일 읽기, 에러 무시
+        try:
+            with open(path, "r", encoding="utf-8", errors='ignore') as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            # UTF-8 실패 시 다른 인코딩 시도
+            logger.warning(f"[QA Loader] UTF-8 decoding failed, trying cp949")
+            try:
+                with open(path, "r", encoding="cp949", errors='ignore') as f:
+                    content = f.read()
+            except:
+                with open(path, "r", encoding="latin-1", errors='ignore') as f:
+                    content = f.read()
 
+        lines = content.splitlines()
         current_section = None
         items: List[dict] = []
 
@@ -153,6 +169,7 @@ class QALoader:
                 continue
             if line.startswith("|:"):
                 continue
+
             cols = [c.strip() for c in line.split("|")[1:-1]]
             if len(cols) < 3:
                 continue
@@ -161,8 +178,12 @@ class QALoader:
 
             question = self.clean_text(cols[0])
             answer = self.clean_text(cols[1])
-            source = self.clean_text(cols[2]) if cols[2] else None
+            source = self.clean_text(cols[2]) if len(cols) > 2 and cols[2] else None
             section = current_section or "기타"
+
+            # 빈 질문이나 답변 스킵
+            if not question or not answer:
+                continue
 
             items.append(
                 {
