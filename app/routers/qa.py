@@ -1,0 +1,262 @@
+"""
+QA Router - Q&A 검색 엔드포인트 (SQLite FTS5)
+"""
+import os
+import re
+import shutil
+import sqlite3
+from datetime import datetime
+from typing import List, Optional
+from dotenv import load_dotenv
+
+from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel, Field
+
+from app.database import db
+
+# Load environment variables
+load_dotenv()
+
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DATA_PATH = os.path.join(BASE_DIR, "data", "hanbang_qa.md")
+
+
+# =========================
+# Schema init
+# =========================
+def init_qa_schema():
+    """Create QA tables/triggers if missing."""
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qa_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                section TEXT NOT NULL,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                source TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS qa_fts USING fts5(
+                question,
+                answer,
+                section,
+                content='qa_documents',
+                content_rowid='id',
+                tokenize='unicode61'
+            )
+            """
+        )
+
+        triggers = [
+            """
+            CREATE TRIGGER IF NOT EXISTS qa_fts_sync_insert
+            AFTER INSERT ON qa_documents BEGIN
+                INSERT INTO qa_fts(rowid, question, answer, section)
+                VALUES (new.id, new.question, new.answer, new.section);
+            END;
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS qa_fts_sync_delete
+            AFTER DELETE ON qa_documents BEGIN
+                DELETE FROM qa_fts WHERE rowid = old.id;
+            END;
+            """,
+        ]
+
+        for sql in triggers:
+            try:
+                cur.execute(sql)
+            except sqlite3.OperationalError as e:
+                if "already exists" not in str(e):
+                    raise
+
+        conn.commit()
+
+
+# =========================
+# Models
+# =========================
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=200)
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+class SearchResponse(BaseModel):
+    success: bool
+    query: str
+    results: List[dict]
+    total: int
+
+
+# =========================
+# Loader
+# =========================
+class QALoader:
+    SECTION_MAP = {
+        "직원": "직원",
+        "정산담당": "정산담당",
+        "식당": "식당",
+        "기술": "기술",
+        "도입": "도입/참여",
+        "최종": "최종정리",
+    }
+
+    ENCODING_FIXES = {
+        "?�권": "쿠폰",
+        "?�산": "정산",
+        "?�당": "식당",
+        "?�스": "서비스",
+        "?�용": "사용",
+        "?�입": "도입",
+    }
+
+    def __init__(self):
+        pass
+
+    def clean_text(self, text: str) -> str:
+        cleaned = text.replace("**", "").strip()
+        for bad, good in self.ENCODING_FIXES.items():
+            cleaned = cleaned.replace(bad, good)
+        return cleaned
+
+    def normalize_section(self, section_line: str) -> str:
+        for key, val in self.SECTION_MAP.items():
+            if key in section_line:
+                return val
+        return section_line.strip()
+
+    def parse_markdown(self, path: str) -> List[dict]:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+
+        current_section = None
+        items: List[dict] = []
+
+        for line in lines:
+            if line.startswith("###"):
+                current_section = self.normalize_section(line)
+                continue
+
+            if not line.startswith("|"):
+                continue
+            if line.startswith("|:"):
+                continue
+            cols = [c.strip() for c in line.split("|")[1:-1]]
+            if len(cols) < 3:
+                continue
+            if "질문" in cols[0] and "답변" in cols[1]:
+                continue
+
+            question = self.clean_text(cols[0])
+            answer = self.clean_text(cols[1])
+            source = self.clean_text(cols[2]) if cols[2] else None
+            section = current_section or "기타"
+
+            items.append(
+                {
+                    "section": section,
+                    "question": question,
+                    "answer": answer,
+                    "source": source,
+                }
+            )
+
+        return items
+
+    def load_to_db(self, path: str) -> int:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Q&A markdown not found: {path}")
+
+        items = self.parse_markdown(path)
+        with db.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM qa_documents")
+            cur.execute("DELETE FROM qa_fts")
+            for qa in items:
+                cur.execute(
+                    """
+                    INSERT INTO qa_documents (section, question, answer, source)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (qa["section"], qa["question"], qa["answer"], qa["source"]),
+                )
+            conn.commit()
+        return len(items)
+
+
+# =========================
+# Service
+# =========================
+class QAService:
+    def search(self, query: str, top_k: int) -> List[dict]:
+        sql = """
+        SELECT
+            d.id,
+            d.section,
+            d.question,
+            d.answer,
+            d.source,
+            fts.rank AS score
+        FROM qa_fts fts
+        JOIN qa_documents d ON fts.rowid = d.id
+        WHERE qa_fts MATCH ?
+        ORDER BY fts.rank
+        LIMIT ?
+        """
+        rows = db.execute_query(sql, (query, top_k))
+        # FTS rank: lower is better; return absolute for readability
+        for r in rows:
+            if "score" in r and r["score"] is not None:
+                r["score"] = abs(r["score"])
+        return rows
+
+
+# =========================
+# Router
+# =========================
+qa_router = APIRouter(prefix="/api/qa", tags=["QA"])
+qa_service = QAService()
+qa_loader = QALoader()
+init_qa_schema()
+
+
+@qa_router.post("/search", response_model=SearchResponse)
+async def search(request: SearchRequest):
+    results = qa_service.search(request.query, request.top_k)
+    return {
+        "success": True,
+        "query": request.query,
+        "results": results,
+        "total": len(results),
+    }
+
+
+@qa_router.post("/reload")
+async def reload(x_api_key: Optional[str] = Header(None)):
+    if ADMIN_API_KEY and x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
+
+    if not os.path.exists(DATA_PATH):
+        raise HTTPException(status_code=404, detail=f"Markdown not found: {DATA_PATH}")
+
+    # Backup before reload
+    backup_dir = os.path.join(BASE_DIR, "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    backup_path = os.path.join(
+        backup_dir, f"katokbot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    )
+    shutil.copy2(db.db_path, backup_path)
+
+    count = qa_loader.load_to_db(DATA_PATH)
+    return {"success": True, "loaded": count, "backup": backup_path}
