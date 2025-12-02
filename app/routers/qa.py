@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sqlite3
+import logging
 from datetime import datetime
 from typing import List, Optional
 from dotenv import load_dotenv
@@ -13,6 +14,8 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.database import db
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -176,11 +179,16 @@ class QALoader:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Q&A markdown not found: {path}")
 
+        logger.info(f"[QA Loader] Loading Q&A from: {path}")
         items = self.parse_markdown(path)
+        logger.info(f"[QA Loader] Parsed {len(items)} Q&A items")
+
         with db.get_connection() as conn:
             cur = conn.cursor()
             cur.execute("DELETE FROM qa_documents")
             cur.execute("DELETE FROM qa_fts")
+            logger.info("[QA Loader] Cleared existing data")
+
             for qa in items:
                 cur.execute(
                     """
@@ -190,6 +198,8 @@ class QALoader:
                     (qa["section"], qa["question"], qa["answer"], qa["source"]),
                 )
             conn.commit()
+            logger.info(f"[QA Loader] Loaded {len(items)} items into database")
+
         return len(items)
 
 
@@ -198,6 +208,8 @@ class QALoader:
 # =========================
 class QAService:
     def search(self, query: str, top_k: int) -> List[dict]:
+        logger.info(f"[QA Search] Query: '{query}', Top K: {top_k}")
+
         sql = """
         SELECT
             d.id,
@@ -212,11 +224,22 @@ class QAService:
         ORDER BY fts.rank
         LIMIT ?
         """
+
+        logger.debug(f"[QA Search] Executing SQL with params: query={query}, top_k={top_k}")
         rows = db.execute_query(sql, (query, top_k))
+
+        logger.info(f"[QA Search] Found {len(rows)} results")
+
         # FTS rank: lower is better; return absolute for readability
         for r in rows:
             if "score" in r and r["score"] is not None:
                 r["score"] = abs(r["score"])
+
+        if rows:
+            logger.debug(f"[QA Search] Top result: {rows[0]['question'][:50]}...")
+        else:
+            logger.warning(f"[QA Search] No results found for query: '{query}'")
+
         return rows
 
 
@@ -231,7 +254,12 @@ init_qa_schema()
 
 @qa_router.post("/search", response_model=SearchResponse)
 async def search(request: SearchRequest):
+    logger.info(f"[QA API] Received search request: query='{request.query}', top_k={request.top_k}")
+
     results = qa_service.search(request.query, request.top_k)
+
+    logger.info(f"[QA API] Returning {len(results)} results")
+
     return {
         "success": True,
         "query": request.query,
