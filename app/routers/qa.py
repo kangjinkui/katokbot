@@ -207,8 +207,31 @@ class QALoader:
 # Service
 # =========================
 class QAService:
+    def sanitize_fts_query(self, query: str) -> str:
+        """
+        FTS5 특수문자 제거 및 쿼리 정제
+        FTS5는 특정 특수문자를 연산자로 해석하므로 제거 필요
+        """
+        # FTS5 특수문자 제거: " ~ ! @ # $ % ^ & * ( ) - + = { } [ ] | \ : ; ' < > , . ? /
+        # 한글, 영문, 숫자, 공백만 유지
+        sanitized = re.sub(r'[^\w\s가-힣]', ' ', query)
+
+        # 연속된 공백을 하나로
+        sanitized = re.sub(r'\s+', ' ', sanitized).strip()
+
+        logger.debug(f"[QA Search] Sanitized query: '{query}' -> '{sanitized}'")
+
+        return sanitized
+
     def search(self, query: str, top_k: int) -> List[dict]:
         logger.info(f"[QA Search] Query: '{query}', Top K: {top_k}")
+
+        # 쿼리 정제
+        sanitized_query = self.sanitize_fts_query(query)
+
+        if not sanitized_query:
+            logger.warning("[QA Search] Query is empty after sanitization")
+            return []
 
         sql = """
         SELECT
@@ -225,8 +248,8 @@ class QAService:
         LIMIT ?
         """
 
-        logger.debug(f"[QA Search] Executing SQL with params: query={query}, top_k={top_k}")
-        rows = db.execute_query(sql, (query, top_k))
+        logger.debug(f"[QA Search] Executing SQL with params: query={sanitized_query}, top_k={top_k}")
+        rows = db.execute_query(sql, (sanitized_query, top_k))
 
         logger.info(f"[QA Search] Found {len(rows)} results")
 
