@@ -277,7 +277,11 @@ class QAService:
                     syns = values
                     break
             if syns:
-                expanded_tokens.append("(" + " OR ".join(syns) + ")")
+                # 각 동의어도 sanitize 처리
+                sanitized_syns = [self.sanitize_fts_query(syn) for syn in syns]
+                sanitized_syns = [s for s in sanitized_syns if s]  # 빈 문자열 제거
+                if sanitized_syns:
+                    expanded_tokens.append("(" + " OR ".join(sanitized_syns) + ")")
             else:
                 expanded_tokens.append(token)
         return " ".join(expanded_tokens)
