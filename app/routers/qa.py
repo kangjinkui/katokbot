@@ -320,11 +320,12 @@ class QAService:
         LIMIT ?
         """
 
-        expanded_query = self.expand_with_synonyms(sanitized_query)
+        # OR 연산자를 사용하지 않고 단순 검색으로 변경
+        # 동의어 확장은 similarity 계산 시 활용
         limit = top_k * 3  # ??? ??? ??? ???
 
-        logger.debug(f"[QA Search] Executing SQL with params: query={expanded_query}, limit={limit}")
-        rows = db.execute_query(sql, (expanded_query, limit))
+        logger.debug(f"[QA Search] Executing SQL with params: query={sanitized_query}, limit={limit}")
+        rows = db.execute_query(sql, (sanitized_query, limit))
 
         logger.info(f"[QA Search] Found {len(rows)} results")
 
