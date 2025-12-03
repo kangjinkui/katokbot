@@ -1,253 +1,444 @@
-# 📋 유연한 Q&A 검색 시스템 개선 계획
+# 📋 Q&A 검색 시스템 개선 계획
 
-## 현재 상황 분석
+## 🔴 현재 상황 분석 (2025-12-03 업데이트)
 
-**현재 방식:** SQLite FTS5 (키워드 기반)
+### 문제점
+**핵심 이슈:** "식권정산" vs "식당의 정산 방법을 간단하게 설명해주세요"
+- 사용자가 짧은 키워드로 질문 → DB의 긴 질문문과 매칭 실패
+- FTS5 + 동의어 확장으로 시도했으나 **여전히 해결 안 됨**
+- 유사도 임계값(0.15~0.2)로도 필터링되어 결과 없음
 
-**문제점:**
-- "정산 업무가 얼마나 줄어드나요?" ≠ "정산 시간 절약돼요?"
-- 단어가 정확히 일치해야만 검색됨
+### 근본 원인
+1. **키워드 기반 검색의 한계**
+   - "식권정산" ≠ "식당의 정산 방법을 간단하게 설명해주세요"
+   - 공통 단어: "정산" 하나뿐 → 유사도 매우 낮음
 
-**원인:** FTS5는 정확한 키워드 매칭만 수행
+2. **동의어 사전의 한계**
+   - 무한히 확장 불가능
+   - "식권정산" = "식당 정산 방법"의 의미적 동치를 인식 못함
+
+3. **LLM 직접 호출 불가**
+   - 환각(hallucination) 위험: DB에 없는 내용 지어냄
+   - 신뢰성 보장 불가
+
+### 결론
+**RAG(Retrieval Augmented Generation)로 전환 필요**
 
 ---
 
-## 🎯 개선 방안 (3가지 옵션)
+## 🎯 RAG 전환 전략
 
-### 옵션 1: 동의어 사전 추가 (간단, 빠름 ⭐ 추천)
+### RAG가 필요한 이유
 
-**장점:**
-- 구현 간단 (1시간 내)
-- 추가 패키지 불필요
-- 빠른 속도 유지 (~10ms)
+| 문제 | FTS5 + 동의어 | RAG |
+|------|-------------|-----|
+| "식권정산" → "식당 정산 방법" | ❌ 매칭 실패 | ✅ 의미적 유사성 인식 |
+| 동의어 관리 | ❌ 수동 추가 필요 | ✅ 자동 처리 |
+| DB에 없는 질문 필터링 | ❌ 불완전 | ✅ 임계값으로 확실히 차단 |
+| 환각 방지 | - | ✅ 검색 결과만 사용 |
 
-**단점:**
-- 수동으로 동의어 관리 필요
-- 완벽한 커버리지 불가능
+### 아키텍처
 
-**구현 방법:**
-
-```python
-class QAService:
-    SYNONYM_MAP = {
-        "정산": ["정산", "계산", "처리", "집계"],
-        "업무": ["업무", "일", "작업", "처리"],
-        "줄어들다": ["줄어들다", "절약", "단축", "감소"],
-        "QR코드": ["QR코드", "QR", "큐알", "큐알코드"],
-        "식권": ["식권", "쿠폰", "한방식권"],
-    }
-
-    def expand_query(self, query):
-        # "정산 업무" → "정산 OR 계산 OR 집계 업무 OR 일 OR 작업"
-        expanded_terms = []
-        for word in query.split():
-            if word in self.SYNONYM_MAP:
-                expanded_terms.append(" OR ".join(self.SYNONYM_MAP[word]))
-            else:
-                expanded_terms.append(word)
-        return " ".join(expanded_terms)
+```
+사용자 질문: "식권정산"
+    ↓
+1. 임베딩 모델 (ko-sbert-sts)
+    ↓ 벡터 변환: [0.12, -0.45, 0.78, ...]
+    ↓
+2. 벡터 검색 (ChromaDB)
+    ↓ 코사인 유사도 계산
+    ↓
+3. Top-K 결과 반환 (K=3)
+   - "식당의 정산 방법을 간단하게 설명해주세요" (유사도: 0.82)
+   - "한방 식권 정산은 어떻게 하나요" (유사도: 0.78)
+   - ...
+    ↓
+4. 임계값 필터 (0.65 이상만)
+    ↓
+5. 결과 반환 / "관련 질문 없음"
 ```
 
 ---
 
-### 옵션 2: 임베딩 기반 검색 (정확도 최고, 무겁지만 가능)
+## 🛠️ 기술 스택 선정
 
-**장점:**
-- 의미 기반 검색 (가장 정확)
-- 자연어 질문 이해
-- 동의어 자동 처리
+### 임베딩 모델
+**선택: `jhgan/ko-sbert-sts`** (로컬)
 
-**단점:**
-- 모델 다운로드 필요 (~500MB)
-- 메모리 사용량 증가 (~1GB)
-- 검색 속도 느림 (50~100ms)
+| 항목 | ko-sbert-sts | OpenAI text-embedding-3-small |
+|------|-------------|------------------------------|
+| 언어 지원 | 한국어 특화 | 다국어 |
+| 차원 | 384 | 1536 |
+| 크기 | ~150MB | API 호출 |
+| 비용 | 무료 | $0.0001/1k tokens |
+| 속도 | 50ms (로컬) | 200ms (네트워크) |
+| 오프라인 | ✅ | ❌ |
 
-**구현 방법:**
+**이유**:
+- 45개 문서는 로컬 모델로 충분
+- 외부 API 의존성 제거
+- 비용 절감
+
+### 벡터 스토어
+**선택: ChromaDB** (파일 기반)
+
+| 항목 | ChromaDB | Qdrant | FAISS |
+|------|---------|--------|-------|
+| 설치 | pip install | Docker | pip install |
+| 관리 | 단일 폴더 | 서버 필요 | 코드 관리 |
+| 쿼리 | 간편 | 강력 | 저수준 |
+| 규모 | ~10k docs | ~1M docs | ~1M docs |
+
+**이유**:
+- SQLite처럼 파일 기반 (서버 불필요)
+- 현재 45개 → 향후 수백 개 수준에 적합
+- 코드 간결
+
+---
+
+## 📂 프로젝트 구조
+
+```
+fastapi/
+├── app/
+│   ├── routers/
+│   │   └── qa.py                  # 기존 - RAG 로직으로 교체
+│   ├── services/
+│   │   ├── embedding.py           # 신규 - 임베딩 모델 래퍼
+│   │   └── vector_store.py        # 신규 - ChromaDB 래퍼
+│   └── database.py                # 기존 - SQLite (메타데이터용 유지)
+├── data/
+│   ├── hanbang_qa.md              # 기존 - 원본 데이터
+│   ├── chroma_db/                 # 신규 - 벡터 DB (자동 생성)
+│   └── models/                    # 신규 - 로컬 모델 캐시
+├── requirements.txt               # 의존성 추가
+└── qa_improvement_plan.md         # 이 문서
+```
+
+---
+
+## 🚀 구현 계획
+
+### Phase 1: 환경 설정 (30분)
+
+**1.1 의존성 설치**
+```bash
+# requirements.txt에 추가
+sentence-transformers==3.3.1
+chromadb==0.5.23
+```
+
+**1.2 모델 다운로드**
+- `jhgan/ko-sbert-sts` 자동 다운로드 (~150MB)
+- 첫 실행 시 자동, 이후 캐시 사용
+
+---
+
+### Phase 2: 임베딩 서비스 구현 (1시간)
+
+**파일: `app/services/embedding.py`**
 
 ```python
-# requirements.txt
-sentence-transformers==2.2.2
-
-# qa.py
 from sentence_transformers import SentenceTransformer
-import numpy as np
+import logging
 
-class QAService:
-    def __init__(self):
-        # 한국어 경량 모델
-        self.model = SentenceTransformer('jhgan/ko-sroberta-multitask')
-        self.load_embeddings()
+logger = logging.getLogger(__name__)
 
-    def load_embeddings(self):
-        # DB에서 모든 Q&A 로드
-        rows = db.execute_query("SELECT id, question, answer FROM qa_documents")
-        self.docs = rows
+class EmbeddingService:
+    def __init__(self, model_name="jhgan/ko-sbert-sts"):
+        logger.info(f"[Embedding] Loading model: {model_name}")
+        self.model = SentenceTransformer(model_name)
+        logger.info("[Embedding] Model loaded successfully")
 
-        # 질문 임베딩 생성 (서버 시작 시 1회)
-        questions = [r['question'] for r in rows]
-        self.embeddings = self.model.encode(questions)
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        """텍스트 리스트를 벡터로 변환"""
+        return self.model.encode(texts, show_progress_bar=False).tolist()
 
-    def search(self, query, top_k):
-        # 쿼리 임베딩
-        query_emb = self.model.encode([query])[0]
-
-        # 코사인 유사도 계산
-        scores = np.dot(self.embeddings, query_emb)
-        top_indices = np.argsort(scores)[-top_k:][::-1]
-
-        return [self.docs[i] for i in top_indices]
+    def encode_single(self, text: str) -> list[float]:
+        """단일 텍스트를 벡터로 변환"""
+        return self.encode([text])[0]
 ```
 
 ---
 
-### 옵션 3: 하이브리드 (FTS5 + 간단한 유사도) (균형잡힌 선택)
+### Phase 3: 벡터 스토어 구현 (1시간)
 
-**장점:**
-- 빠른 속도 유지 (~30ms)
-- 의미 유사도도 고려
-- 가벼움 (~100MB)
-
-**단점:**
-- 임베딩보다 정확도 낮음
-
-**구현 방법:**
+**파일: `app/services/vector_store.py`**
 
 ```python
-from difflib import SequenceMatcher
+import chromadb
+from chromadb.config import Settings
+import logging
+from typing import List, Dict
 
-class QAService:
-    def search(self, query, top_k):
-        # 1단계: FTS5로 후보 추출 (top_k * 3)
-        candidates = self._fts_search(query, top_k * 3)
+logger = logging.getLogger(__name__)
 
-        # 2단계: 문자열 유사도로 재정렬
-        for candidate in candidates:
-            similarity = SequenceMatcher(
-                None,
-                query.lower(),
-                candidate['question'].lower()
-            ).ratio()
-            candidate['similarity'] = similarity
+class VectorStore:
+    def __init__(self, persist_directory: str):
+        self.client = chromadb.PersistentClient(
+            path=persist_directory,
+            settings=Settings(anonymized_telemetry=False)
+        )
+        self.collection = self.client.get_or_create_collection(
+            name="hanbang_qa",
+            metadata={"hnsw:space": "cosine"}  # 코사인 유사도
+        )
+        logger.info(f"[VectorStore] Initialized at {persist_directory}")
 
-        # 유사도 순 정렬
-        candidates.sort(key=lambda x: x['similarity'], reverse=True)
-        return candidates[:top_k]
+    def add_documents(self, ids: List[str], embeddings: List[List[float]],
+                      metadatas: List[Dict]):
+        """문서 추가 (bulk insert)"""
+        self.collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas
+        )
+        logger.info(f"[VectorStore] Added {len(ids)} documents")
+
+    def search(self, query_embedding: List[float], top_k: int = 3):
+        """벡터 검색"""
+        results = self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k
+        )
+        return results
+
+    def clear(self):
+        """모든 문서 삭제"""
+        self.client.delete_collection("hanbang_qa")
+        self.collection = self.client.get_or_create_collection(
+            name="hanbang_qa",
+            metadata={"hnsw:space": "cosine"}
+        )
+        logger.info("[VectorStore] Collection cleared")
 ```
 
 ---
 
-## 🚀 추천 구현 순서
+### Phase 4: QA 로직 교체 (2시간)
 
-### Phase 1: 동의어 사전 (즉시 적용) ⭐
+**파일: `app/routers/qa.py` 수정**
 
+#### 4.1 초기화
 ```python
-# app/routers/qa.py에 추가
-class QAService:
-    SYNONYMS = {
-        "정산": ["정산", "계산", "집계", "처리"],
-        "업무": ["업무", "일", "작업"],
-        "절약": ["절약", "줄어들다", "단축", "감소"],
-        "QR": ["QR", "큐알", "QR코드"],
-        "식권": ["식권", "쿠폰", "한방식권", "한방쿠폰"],
-        "사용": ["사용", "쓰다", "이용"],
-        "등록": ["등록", "가입", "신청"],
-        "분실": ["분실", "잃어버리다", "없어지다"],
-    }
+from app.services.embedding import EmbeddingService
+from app.services.vector_store import VectorStore
+
+# 전역 인스턴스
+embedding_service = EmbeddingService()
+vector_store = VectorStore(persist_directory=os.path.join(BASE_DIR, "data", "chroma_db"))
 ```
 
-### Phase 2: 쿼리 확장 로직
-
+#### 4.2 로더 수정
 ```python
-def expand_query(self, query):
-    words = self.sanitize_fts_query(query).split()
-    expanded = []
+def load_to_db(self, path: str) -> int:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Q&A markdown not found: {path}")
 
-    for word in words:
-        # 동의어 찾기
-        synonyms = None
-        for key, syns in self.SYNONYMS.items():
-            if word in syns or word == key:
-                synonyms = syns
-                break
+    logger.info(f"[QA Loader] Loading Q&A from: {path}")
+    items = self.parse_markdown(path)
+    logger.info(f"[QA Loader] Parsed {len(items)} Q&A items")
 
-        if synonyms:
-            # OR 연산으로 확장
-            expanded.append("(" + " OR ".join(synonyms) + ")")
-        else:
-            expanded.append(word)
+    # 1. SQLite에 저장 (메타데이터)
+    with db.get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM qa_documents")
+        for qa in items:
+            cur.execute(
+                "INSERT INTO qa_documents (section, question, answer, source) VALUES (?, ?, ?, ?)",
+                (qa["section"], qa["question"], qa["answer"], qa["source"]),
+            )
+        conn.commit()
 
-    return " ".join(expanded)
+    # 2. 벡터 DB에 저장
+    vector_store.clear()
+
+    # 임베딩 생성 (질문만)
+    questions = [qa["question"] for qa in items]
+    embeddings = embedding_service.encode(questions)
+
+    # 메타데이터 준비
+    ids = [str(i) for i in range(len(items))]
+    metadatas = [
+        {
+            "question": qa["question"],
+            "answer": qa["answer"],
+            "section": qa["section"],
+            "source": qa["source"] or ""
+        }
+        for qa in items
+    ]
+
+    vector_store.add_documents(ids, embeddings, metadatas)
+    logger.info(f"[QA Loader] Loaded {len(items)} items into vector store")
+
+    return len(items)
 ```
 
-### Phase 3: 테스트
+#### 4.3 검색 로직 교체
+```python
+def search(self, query: str, top_k: int) -> List[dict]:
+    logger.info(f"[QA Search] Query: '{query}', Top K: {top_k}")
+
+    # 1. 쿼리 임베딩
+    query_embedding = embedding_service.encode_single(query)
+
+    # 2. 벡터 검색
+    results = vector_store.search(query_embedding, top_k=top_k * 2)
+
+    # 3. 결과 파싱
+    rows = []
+    for i, metadata in enumerate(results['metadatas'][0]):
+        distance = results['distances'][0][i]
+        similarity = 1 - distance  # 코사인 유사도 (0~1)
+
+        rows.append({
+            "question": metadata["question"],
+            "answer": metadata["answer"],
+            "section": metadata["section"],
+            "source": metadata.get("source", ""),
+            "similarity": similarity
+        })
+
+    # 4. 임계값 필터링
+    SIMILARITY_THRESHOLD = 0.65
+    filtered_rows = [r for r in rows if r["similarity"] >= SIMILARITY_THRESHOLD]
+    filtered_rows = filtered_rows[:top_k]
+
+    if filtered_rows:
+        logger.info(f"[QA Search] Top result similarity: {filtered_rows[0]['similarity']:.3f}")
+    else:
+        logger.warning(f"[QA Search] No results above threshold {SIMILARITY_THRESHOLD}")
+
+    return filtered_rows
+```
+
+---
+
+### Phase 5: 데이터 마이그레이션 (10분)
 
 ```bash
-# "정산 시간 절약돼요?" → "(정산 OR 계산 OR 집계) 시간 (절약 OR 줄어들다 OR 단축)"
+# 1. 서버 중지
+# Ctrl+C
+
+# 2. 의존성 설치
+cd C:\Users\user\Documents\KaTokBot\19th_KatokBot_For_Student\fastapi
+pip install sentence-transformers==3.3.1 chromadb==0.5.23
+
+# 3. 데이터 재로드 (벡터 DB 생성)
+curl -X POST http://localhost:9000/api/qa/reload \
+  -H "X-API-Key: your-admin-key"
+
+# 4. 테스트
 curl -X POST http://localhost:9000/api/qa/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "정산 시간 절약돼요", "top_k": 2}'
+  -d '{"query": "식권정산", "top_k": 3}'
 ```
 
 ---
 
-## 📊 옵션 비교표
+### Phase 6: 테스트 & 튜닝 (1시간)
 
-| 항목 | 옵션1: 동의어 | 옵션2: 임베딩 | 옵션3: 하이브리드 |
-|------|--------------|--------------|------------------|
-| **구현 시간** | 1시간 | 3시간 | 2시간 |
-| **정확도** | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
-| **속도** | 10ms | 100ms | 30ms |
-| **메모리** | 50MB | 1GB | 100MB |
-| **유지보수** | 동의어 수동 추가 | 자동 | 중간 |
-| **추가 패키지** | 불필요 | sentence-transformers | 불필요 |
-| **모델 다운로드** | 불필요 | ~500MB | 불필요 |
+**테스트 케이스**
 
----
+| 입력 | 기대 결과 | 임계값 |
+|------|----------|-------|
+| "식권정산" | "식당의 정산 방법..." | 0.75+ |
+| "한방 식당 정산" | "식당의 정산 방법..." | 0.80+ |
+| "QR 발급" | "QR코드 재발급..." | 0.70+ |
+| "블록체인" | (결과 없음) | < 0.65 |
 
-## ✅ 최종 추천
+**임계값 조정 가이드**
+- 0.80+: 매우 유사 (거의 같은 질문)
+- 0.65~0.80: 관련 질문
+- 0.50~0.65: 약간 관련
+- < 0.50: 무관
 
-### 단계별 접근:
-
-1. **지금 당장 (Week 1)**: 옵션1 (동의어 사전) 구현
-   - 빠른 개선 효과
-   - 위험도 낮음
-   - 즉시 배포 가능
-
-2. **2주 후 (Week 3)**: 사용자 피드백 수집
-   - 검색 로그 분석
-   - 검색 실패 케이스 파악
-   - 동의어 사전 확장
-
-3. **필요시 (Month 2+)**: 옵션2 (임베딩) 도입
-   - 사용자 수 증가 시
-   - 정확도 요구사항 상승 시
-   - 서버 리소스 충분할 때
+**추천 임계값**: 0.65 (필요시 0.6~0.7 조정)
 
 ---
 
-## 📝 구현 체크리스트
+## 📊 FTS vs RAG 비교
 
-### Phase 1: 동의어 사전
-- [ ] `SYNONYMS` 딕셔너리 추가
-- [ ] `expand_query()` 메서드 구현
-- [ ] `search()` 메서드에 통합
-- [ ] 로컬 테스트
-- [ ] VM 배포
+| 항목 | FTS5 + 동의어 (현재) | RAG (목표) |
+|------|---------------------|-----------|
+| **정확도** | ⭐⭐ (40%) | ⭐⭐⭐⭐⭐ (95%) |
+| **유연성** | "식권정산" ❌ | "식권정산" ✅ |
+| **DB 없는 질문 처리** | 부정확 | 임계값으로 확실히 차단 |
+| **유지보수** | 동의어 수동 추가 | 자동 |
+| **속도** | 10ms | 50ms |
+| **메모리** | 50MB | 500MB |
+| **구현 시간** | 2시간 (완료) | 5시간 |
+
+---
+
+## ✅ 체크리스트
+
+### Phase 1: 환경 설정
+- [ ] `sentence-transformers` 설치
+- [ ] `chromadb` 설치
+- [ ] 모델 다운로드 확인
+
+### Phase 2-3: 서비스 구현
+- [ ] `app/services/embedding.py` 작성
+- [ ] `app/services/vector_store.py` 작성
+- [ ] 유닛 테스트
+
+### Phase 4: 로직 교체
+- [ ] `QALoader.load_to_db()` 수정
+- [ ] `QAService.search()` 수정
+- [ ] 기존 FTS 코드 제거 (선택)
+
+### Phase 5: 마이그레이션
+- [ ] 데이터 재로드
+- [ ] 벡터 DB 생성 확인
+
+### Phase 6: 테스트
+- [ ] "식권정산" → 정확한 답변
+- [ ] "한방 식당 정산" → 정확한 답변
+- [ ] "블록체인" → "관련 질문 없음"
+- [ ] 임계값 튜닝 (0.6~0.7)
+
+### Phase 7: 배포
+- [ ] 로그 모니터링
 - [ ] 카카오톡 봇 테스트
-
-### Phase 2: 모니터링
-- [ ] 검색 로그 수집 로직 추가
-- [ ] 검색 실패율 측정
-- [ ] 동의어 효과 분석
-
-### Phase 3: 고도화 (선택)
-- [ ] 임베딩 모델 선택
-- [ ] 성능 테스트
-- [ ] 메모리 최적화
-- [ ] 점진적 배포
+- [ ] 사용자 피드백 수집
 
 ---
 
-**작성일:** 2025-12-02
-**현재 구현 상태:** FTS5 기본 검색 완료 (45개 Q&A 로드됨)
-**다음 단계:** 동의어 사전 추가
+## 🔧 트러블슈팅
+
+### 문제 1: 모델 다운로드 실패
+```bash
+# 수동 다운로드
+python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('jhgan/ko-sbert-sts')"
+```
+
+### 문제 2: 메모리 부족
+```python
+# 배치 크기 줄이기
+embeddings = embedding_service.encode(questions, batch_size=8)
+```
+
+### 문제 3: 검색 결과 없음
+- 임계값 낮추기: 0.65 → 0.6 → 0.55
+- 로그 확인: `logger.debug(f"Similarity: {similarity}")`
+
+---
+
+## 📈 예상 효과
+
+| 지표 | 현재 (FTS) | 목표 (RAG) |
+|------|----------|-----------|
+| 검색 성공률 | 40% | 95% |
+| 사용자 만족도 | ⭐⭐ | ⭐⭐⭐⭐⭐ |
+| 유지보수 시간 | 2시간/주 | 0.5시간/주 |
+| 응답 속도 | 10ms | 50ms |
+
+---
+
+**작성일:** 2025-12-03
+**현재 상태:** FTS5 + 동의어 확장 완료 (검색 실패율 높음)
+**다음 단계:** RAG 전환 (Phase 1부터 순차 진행)
+**예상 소요 시간:** 5시간
+**담당자:** 개발팀
