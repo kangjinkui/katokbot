@@ -231,19 +231,23 @@ class QALoader:
 
 
 class QAService:
-    # ?? ??? ?? (RAG ??? ?? ?? ??)
+    # 동의어 사전 (검색 개선용)
     SYNONYMS = {
-        "정산": ["정산", "계산", "집계", "처리"],
-        "업무": ["업무", "작업", "일", "처리"],
-        "시간": ["시간", "소요", "기간"],
-        "절약": ["절약", "단축", "감소"],
-        "식권": ["식권", "쿠폰", "한방쿠폰"],
-        "qr": ["qr", "qr코드", "큐알", "큐알c크론"],
-        "발급": ["발급", "출력", "배포", "재발급"],
-        "보고": ["보고", "보고서", "리포트", "정산보고"],
-        "결재": ["결재", "결제"],
-        "분실": ["분실", "유실", "잃어버림"],
-        "말일": ["말일", "월말", "마감"],
+        "정산": ["정산", "계산", "집계", "처리", "결산"],
+        "업무": ["업무", "작업", "일", "처리", "업무처리"],
+        "시간": ["시간", "소요", "기간", "소요시간"],
+        "절약": ["절약", "단축", "감소", "줄이기"],
+        "식권": ["식권", "쿠폰", "한방쿠폰", "식사권"],
+        "qr": ["qr", "qr코드", "큐알", "큐알코드", "코드"],
+        "발급": ["발급", "출력", "배포", "재발급", "발행"],
+        "보고": ["보고", "보고서", "리포트", "정산보고", "리포팅"],
+        "결재": ["결재", "결제", "승인"],
+        "분실": ["분실", "유실", "잃어버림", "분실시"],
+        "말일": ["말일", "월말", "마감", "월말정산"],
+        "식당": ["식당", "한방식당", "한방", "음식점", "레스토랑"],
+        "방법": ["방법", "절차", "프로세스", "과정"],
+        "설명": ["설명", "알려줘", "안내", "가르쳐줘"],
+        "직원": ["직원", "사원", "임직원", "근로자"],
     }
 
     def normalize(self, text: str) -> str:
@@ -305,6 +309,14 @@ class QAService:
             logger.warning("[QA Search] Query is empty after sanitization")
             return []
 
+        # 동의어로 검색 쿼리 확장
+        expanded_query = self.expand_with_synonyms(sanitized_query)
+
+        # 부분 일치를 위한 prefix matching 추가
+        tokens = expanded_query.split()
+        prefix_tokens = [f"{token}*" if not token.startswith("(") else token for token in tokens]
+        fts_query = " ".join(prefix_tokens)
+
         sql = """
         SELECT
             d.id,
@@ -320,12 +332,16 @@ class QAService:
         LIMIT ?
         """
 
-        # OR 연산자를 사용하지 않고 단순 검색으로 변경
-        # 동의어 확장은 similarity 계산 시 활용
-        limit = top_k * 3  # ??? ??? ??? ???
+        limit = top_k * 5  # 더 많은 후보를 가져와서 유사도로 재정렬
 
-        logger.debug(f"[QA Search] Executing SQL with params: query={sanitized_query}, limit={limit}")
-        rows = db.execute_query(sql, (sanitized_query, limit))
+        logger.debug(f"[QA Search] Executing SQL with params: query={fts_query}, limit={limit}")
+
+        try:
+            rows = db.execute_query(sql, (fts_query, limit))
+        except sqlite3.OperationalError as e:
+            logger.warning(f"[QA Search] FTS query failed: {e}, falling back to simple query")
+            # OR 연산 실패 시 단순 검색으로 폴백
+            rows = db.execute_query(sql, (sanitized_query, limit))
 
         logger.info(f"[QA Search] Found {len(rows)} results")
 
@@ -333,19 +349,24 @@ class QAService:
             if "score" in r and r["score"] is not None:
                 r["score"] = abs(r["score"])
 
-        # ???: ?? ???? ?? ?? ??
+        # 유사도 계산: 사용자 쿼리와 질문 간 유사도
         for r in rows:
             r["similarity"] = self.similarity(query, r["question"])
 
+        # 유사도 기준으로 정렬 후 상위 K개 선택
         rows.sort(key=lambda x: x.get("similarity", 0), reverse=True)
-        rows = rows[:top_k]
 
-        if rows:
-            logger.debug(f"[QA Search] Top result: {rows[0]['question'][:50]}...")
+        # 유사도 임계값 적용 (0.2 이상만 반환)
+        SIMILARITY_THRESHOLD = 0.2
+        filtered_rows = [r for r in rows if r.get("similarity", 0) >= SIMILARITY_THRESHOLD]
+        filtered_rows = filtered_rows[:top_k]
+
+        if filtered_rows:
+            logger.info(f"[QA Search] Top result similarity: {filtered_rows[0]['similarity']:.3f}, question: {filtered_rows[0]['question'][:50]}...")
         else:
-            logger.warning(f"[QA Search] No results found for query: '{query}'")
+            logger.warning(f"[QA Search] No results above threshold {SIMILARITY_THRESHOLD} for query: '{query}'")
 
-        return rows
+        return filtered_rows
 
 # =========================
 # Router
