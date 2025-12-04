@@ -198,7 +198,7 @@ class QALoader:
 # Service
 # =========================
 class QAService:
-    SIMILARITY_THRESHOLD = 0.65
+    SIMILARITY_THRESHOLD = 0.7
 
     def __init__(self, embedding_service: EmbeddingService, vector_store: VectorStore):
         self.embedding_service = embedding_service
